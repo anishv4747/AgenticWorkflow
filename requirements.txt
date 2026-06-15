@@ -1,16 +1,49 @@
-# Common baseline dependencies for AI/ML Python projects
-# Install with: <env-python> -m pip install -r requirements.txt
+# Install with: pip install -r requirements.txt
 
+# Core ML/data
 numpy>=1.26,<3
 pandas>=2.2,<3
 matplotlib>=3.8,<4
 scikit-learn>=1.5,<2
-jupyterlab>=4.2,<5
-ipykernel>=6.29,<7
+torch>=2.4,<3
+
+# LLM + embeddings
+openai>=1.30
+anthropic>=0.25
+sentence-transformers>=3.0
+
+# Vector store
+chromadb>=0.5
+
+# Agent framework + observability
+langchain>=0.2
+langgraph>=0.1
+langsmith>=0.1
+
+# Alignment
+trl>=0.9
+
+# Prompt optimization
+dspy-ai>=2.4
+
+# Clustering + projection
+hdbscan>=0.8
+umap-learn>=0.5
+
+# Dashboard
+streamlit>=1.35
+plotly>=5.22
+
+# Graph
+networkx>=3.3
+
+# Data store
+# sqlite3 is stdlib — no install needed
+
+# Dev tools
+python-dotenv>=1.0
 pytest>=8.2,<9
 ruff>=0.6,<1
 black>=24.8,<26
-mypy>=1.11,<2
-torch>=2.4,<3
-torchvision>=0.19,<1
-torchaudio>=2.4,<3
+jupyterlab>=4.2,<5
+ipykernel>=6.29,<7
