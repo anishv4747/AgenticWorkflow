@@ -1,14 +1,15 @@
 """
 Medical Device Complaint Pipeline — Working skeleton.
 
-Risk Analysis Agent: fully implemented (ISO 14971, LLM, guardrails).
-All other agents: mock stubs returning hardcoded realistic data.
+Risk Analysis Agent: fully implemented (ISO 14971, two-pass LLM, guardrails).
+Retrieval Agent: fully implemented (live openFDA API, single-pass RAG).
+Extraction, Similarity, Report: mock stubs returning hardcoded realistic data.
 
 Usage:
     python pipeline.py
     python pipeline.py --complaint "Your complaint text here"
 
-Requires: OPENAI_API_KEY in environment or .env file.
+Requires: ANTHROPIC_API_KEY in environment or .env file.
 """
 
 import os
@@ -23,6 +24,12 @@ from dotenv import load_dotenv
 from langgraph.graph import StateGraph, END
 
 from agents.risk_analysis import risk_analysis_agent  # noqa: F401 (re-exported for graph)
+from agents.retrieval import retrieval_agent  # noqa: F401 (re-exported for graph)
+
+# Windows console defaults to cp1252, which can't encode the box-drawing
+# characters used in the debug output below.
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8")
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -143,86 +150,7 @@ def extraction_agent(state: ComplaintState) -> dict:
     return out
 
 
-def retrieval_agent(state: ComplaintState) -> dict:
-    """MOCK — Replace with real ChromaDB + openFDA retrieval when ready."""
-    _hdr("RETRIEVAL AGENT  [MOCK]")
-    _reading({
-        "failure_mode": state.get("failure_mode"),
-        "modality":     state.get("modality"),
-        "manufacturer": state.get("manufacturer"),
-    })
-
-    events = [
-        {
-            "report_number": "MW3021547",
-            "relevance_score": 0.87,
-            "narrative_snippet": (
-                "MRI banding artifacts observed during cardiac SSFP imaging on "
-                "Philips Achieva 1.5T. Images non-diagnostic, repeat scan required."
-            ),
-            "manufacturer": "Philips Medical Systems",
-            "product_code": "LNH",
-            "date_received": "2024-03-15",
-        },
-        {
-            "report_number": "MW2998341",
-            "relevance_score": 0.79,
-            "narrative_snippet": (
-                "Horizontal banding artifacts in SSFP sequences. Attributed to "
-                "RF pulse timing software error. SW version 5.6.2. Diagnostic delay."
-            ),
-            "manufacturer": "Philips Medical Systems",
-            "product_code": "LNH",
-            "date_received": "2023-11-08",
-        },
-        {
-            "report_number": "MW3014892",
-            "relevance_score": 0.71,
-            "narrative_snippet": (
-                "Image artifact pattern consistent with gradient timing mismatch. "
-                "Affected cardiac cine imaging. Patient rescanned on different unit."
-            ),
-            "manufacturer": "Philips Medical Systems",
-            "product_code": "LNH",
-            "date_received": "2024-01-22",
-        },
-    ]
-    recalls = [
-        {
-            "recall_id": "Z-2024-00423",
-            "reason_for_recall": (
-                "Software defect causing image reconstruction artifacts in SSFP "
-                "cardiac sequences on Philips Achieva MRI systems"
-            ),
-            "root_cause": "Software design — RF pulse timing calculation error in reconstruction kernel",
-            "action": "Software update v5.7.2 released; field correction advisory issued to all sites",
-            "manufacturer": "Philips Medical Systems",
-            "product_code": "LNH",
-            "recall_class": "II",
-            "relevance_score": 0.93,
-        }
-    ]
-    regulatory_context = (
-        "Three prior MAUDE adverse events (MW3021547, MW2998341, MW3014892) and one Class II "
-        "recall (Z-2024-00423) found for the same failure mode (SSFP banding artifacts) on "
-        "Philips LNH devices. Root cause: RF pulse timing software defect. Software fix "
-        "available as v5.7.2."
-    )
-
-    print("  → writing to state:")
-    print(f"      {'matching_events':<30} = {len(events)} events " +
-          ", ".join(e["report_number"] for e in events))
-    print(f"      {'matching_recalls':<30} = {len(recalls)} recall(s): " +
-          ", ".join(r["recall_id"] for r in recalls))
-    print(f"      {'regulatory_context':<30} = {regulatory_context[:70]}...")
-    print(f"      {'low_confidence_retrieval':<30} = False")
-
-    return {
-        "matching_events": events,
-        "matching_recalls": recalls,
-        "regulatory_context": regulatory_context,
-        "low_confidence_retrieval": False,
-    }
+# retrieval_agent → imported from agents/retrieval.py (live openFDA API)
 
 
 def similarity_module(state: ComplaintState) -> dict:

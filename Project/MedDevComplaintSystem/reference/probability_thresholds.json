@@ -1,0 +1,24 @@
+{
+  "_comment": "Numeric breakpoints for compute_probability(). Calibrated as a starting point against CLAUDE.md dataset facts (~14K imaging events, 32.6% software-design recalls). Draft v1 — needs review against real event-count distributions per failure mode.",
+  "event_count_breakpoints": {
+    "_comment": "Base probability level from count of directly matching FDA adverse events (state.matching_events). Smallest breakpoint the count is <= determines the level.",
+    "P1": 0,
+    "P2": 2,
+    "P3": 5,
+    "P4": 15
+  },
+  "recall_override": {
+    "_comment": "A confirmed recall for the same failure mode means the issue is at least 'occasional' even with few individual event reports.",
+    "min_recall_count_for_P3": 1
+  },
+  "growth_rate_overrides": {
+    "_comment": "30-day cluster growth rate from the Similarity Module. A fast-growing cluster raises probability regardless of raw event count, since it signals an emerging pattern not yet fully reported.",
+    "P4_min_growth_rate": 0.3,
+    "P5_min_growth_rate": 0.5
+  },
+  "cluster_size_overrides": {
+    "_comment": "Large existing cluster size is independent evidence of higher occurrence rate.",
+    "P4_min_cluster_size": 50,
+    "P5_min_cluster_size": 200
+  }
+}

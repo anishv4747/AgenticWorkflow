@@ -1,0 +1,21 @@
+{
+  "_comment": "Deterministic risk_level -> CAPA timing/notification requirements for lookup_capa_requirements(). The LLM's CAPA narrative must be consistent with these fixed values, never invent its own timeline.",
+  "UNACCEPTABLE": {
+    "immediate_action_required": true,
+    "containment_timeline_hours": 24,
+    "prrc_notification_required": true,
+    "investigation_required": true
+  },
+  "ALARP": {
+    "immediate_action_required": true,
+    "containment_timeline_hours": 168,
+    "prrc_notification_required": false,
+    "investigation_required": true
+  },
+  "ACCEPTABLE": {
+    "immediate_action_required": false,
+    "containment_timeline_hours": null,
+    "prrc_notification_required": false,
+    "investigation_required": true
+  }
+}

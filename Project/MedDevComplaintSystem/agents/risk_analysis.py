@@ -1,14 +1,24 @@
 """
-Risk Analysis Agent — full ISO 14971:2019 implementation.
+Risk Analysis Agent — tool-first ISO 14971:2019 implementation.
 
-Two-pass design:
-    Pass 1  →  generate complete risk assessment + CAPA from complaint context
-    Pass 2  →  self-critique against a checklist; return revised assessment
+Design: severity, probability, risk_level, CAPA timing, and escalation flags
+are computed by DETERMINISTIC TOOLS (agents/risk_tools.py) — never generated
+freehand by an LLM. The same complaint + same evidence always produces the
+same numbers.
 
-Constitutional guardrail (enforced in Python after Pass 2):
-    ALARP or UNACCEPTABLE with zero evidence citations → forced downgrade to ACCEPTABLE.
+Flow:
+    1. score_severity(complaint_text)                          — tool
+    2. compute_probability(event_count, recall_count, ...)     — tool
+    3. apply_risk_matrix(severity_level, probability_level)    — tool
+    4. load_past_reports(failure_mode, modality)                — tool (SQLite)
+    5. lookup_capa_requirements(risk_level)                     — tool
+    6. LLM call — narrative ONLY, given the fixed numbers above
+    7. validate_evidence_citations(...)                         — tool (strips hallucinated IDs)
+    8. compute_escalation_flags(risk_level, evidence_count)     — tool
 
-Escalation flags are computed deterministically in Python, never by the LLM.
+The LLM never decides severity_level, probability_level, or risk_level — it
+writes the hazardous_situation/harm/rationale/CAPA prose that explains a
+result the tools already fixed.
 
 Episodic memory:
     load_past_reports() queries SQLite signal_reports table for prior similar cases.
@@ -16,14 +26,41 @@ Episodic memory:
     save_report() is called by the report agent, not here — this module only reads.
 """
 
-
+import re
 import json
 import sqlite3
 import logging
 from pathlib import Path
 from anthropic import Anthropic
 
+from agents.risk_tools import (
+    score_severity,
+    compute_probability,
+    apply_risk_matrix,
+    validate_evidence_citations,
+    lookup_capa_requirements,
+    compute_escalation_flags,
+)
+
 logger = logging.getLogger(__name__)
+
+
+def _parse_json_response(text: str) -> dict:
+    """
+    claude-sonnet-4-6 doesn't support assistant-message prefill, so we can't
+    force the response to open with '{'. Strip markdown fences if the model
+    wrapped the JSON in them, then parse the first {...} block.
+    """
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1:
+        raise ValueError(f"No JSON object found in response: {text[:200]}")
+    return json.loads(text[start:end + 1])
+
 
 # ── SQLite setup ──────────────────────────────────────────────────────────────
 
@@ -129,115 +166,47 @@ def save_report(
         conn.commit()
 
 
-# ── Prompts ───────────────────────────────────────────────────────────────────
+# ── Narrative prompt — the LLM explains fixed numbers, it does not set them ───
 
-_PASS1_SYSTEM = """\
-You are a medical device risk analyst applying ISO 14971:2019.
+_NARRATIVE_SYSTEM = """\
+You are a medical device risk analyst writing the narrative for an ISO 14971:2019 risk
+assessment.
 
-Your task: given a device complaint, prior FDA evidence, trend data, and any past similar
-signal reports, produce a complete risk assessment and CAPA recommendation.
+CRITICAL: severity_level, probability_level, and risk_level have ALREADY been determined
+by deterministic rule-based tools — you are NOT deciding them and you MUST NOT contradict
+them. Your job is narrower:
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-ISO 14971 SEVERITY SCALE (Annex D)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-S1 (Negligible)   – No injury; no clinical impact; inconvenience only.
-S2 (Minor)        – Minor, reversible injury; minor delay in diagnosis.
-S3 (Serious)      – Serious injury; major delay in diagnosis; repeat procedure required.
-S4 (Critical)     – Permanent injury; surgical intervention required.
-S5 (Catastrophic) – Death.
+1. Write hazardous_situation and harm — describe the specific failure → exposure → harm
+   pathway, grounded in the complaint text.
+2. Write severity_rationale and probability_rationale — explain, in plain language, why the
+   GIVEN severity_level and probability_level fit this complaint and evidence. Reference the
+   matched keywords / evidence counts you are given.
+3. Propose evidence_basis citations — ONLY use MAUDE report numbers or recall IDs that
+   literally appear in the "Available Evidence" section below. Do not invent IDs. If no
+   evidence is available, return an empty list and say so in uncertainty.
+4. Write a CAPA narrative consistent with the REQUIRED CAPA PARAMETERS you are given
+   (e.g. if containment_timeline_hours=24, capa_immediate must reflect a 24-hour timeline;
+   if prrc_notification_required=true, capa_immediate must mention PRRC notification).
+5. Write uncertainty — what is unknown or unconfirmed, and what would change the assessment.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-ISO 14971 PROBABILITY SCALE (calibrated to ~14,000 FDA imaging device events)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-P1 (Improbable) – < 1 per 1,000,000 uses.
-P2 (Remote)     – 1 per 100,000 to 1 per 1,000,000.
-P3 (Occasional) – 1 per 10,000 to 1 per 100,000.
-P4 (Probable)   – 1 per 1,000 to 1 per 10,000.
-P5 (Frequent)   – > 1 per 1,000.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-RISK ACCEPTABILITY MATRIX (5×5)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-ACCEPTABLE:    S1×(P1–P5)  S2×(P1–P3)  S3×(P1–P2)  S4×P1   S5×P1
-ALARP:         S2×(P4–P5)  S3×(P3–P4)  S4×(P2–P3)  S5×(P2–P3)
-UNACCEPTABLE:  S3×P5  S4×(P4–P5)  S5×(P4–P5)
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-EVIDENCE CITATION REQUIREMENT
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-NEVER assign ALARP or UNACCEPTABLE unless evidence_basis contains at least one specific
-FDA record (MAUDE report number or recall ID) that justifies the probability estimate.
-If you cannot cite evidence, assign ACCEPTABLE and document the uncertainty.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-REASONING APPROACH
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-1. Identify the hazardous situation (device failure → patient/operator exposure path).
-2. Identify the specific harm (what injury or consequence results).
-3. Justify severity S1–S5 from the complaint and evidence.
-4. Justify probability P1–P5 using event counts, recall history, and trend data.
-5. Apply the matrix to determine risk_level.
-6. Cite real FDA record IDs in evidence_basis — do not invent IDs.
-7. Generate CAPA proportionate to risk_level:
-   UNACCEPTABLE → immediate containment within hours is mandatory.
-   ALARP         → immediate action and formal investigation.
-   ACCEPTABLE    → investigation and preventive action.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-OUTPUT FORMAT
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Return ONLY a valid JSON object. No markdown fences, no prose outside the JSON.
-
+Return ONLY a valid JSON object, no markdown fences, no prose outside the JSON:
 {
-  "chain_of_thought": "Step-by-step reasoning (not shown to QM, used for audit trail)",
-  "hazardous_situation": "Specific situation: device failure → operator/patient exposure path",
-  "harm": "Specific harm: injury or consequence to patient or operator",
-  "severity_level": "S1|S2|S3|S4|S5",
-  "severity_rationale": "1–2 sentences citing complaint language and evidence",
-  "probability_level": "P1|P2|P3|P4|P5",
-  "probability_rationale": "Cite specific FDA record IDs to justify — e.g. '3 MAUDE events (MW3021547, MW2998341, MW3014892) + 1 Class II recall (Z-2024-00423) for the same failure mode'",
-  "risk_level": "ACCEPTABLE|ALARP|UNACCEPTABLE",
+  "hazardous_situation": "string",
+  "harm": "string",
+  "severity_rationale": "string",
+  "probability_rationale": "string",
   "evidence_basis": [
-    {"source": "MAUDE|RECALL", "id": "string", "relevance": "one sentence why this record applies"}
+    {"source": "MAUDE|RECALL", "id": "string (must exist in Available Evidence)", "relevance": "one sentence"}
   ],
-  "uncertainty": "What is unknown or unconfirmed — e.g. patient outcome not reported, root cause not yet verified",
-  "capa_immediate": "Immediate containment action and timeline (e.g. 'Within 24h: notify field service to check SW version at all affected sites')",
-  "capa_investigation": "Root cause investigation steps and responsible function",
-  "capa_corrective": "Corrective action per ISO 13485 §8.5.2 (fix the root cause)",
-  "capa_preventive": "Preventive action per ISO 13485 §8.5.3 (prevent recurrence in other products)",
-  "capa_verification": "How to verify the CAPA is effective (test, audit, metric)",
-  "capa_effectiveness": "Measurable criteria for effectiveness (e.g. '0 recurrence events in 90 days post-fix')",
-  "capa_precedent": "Real MAUDE report number or recall ID used as basis for the CAPA recommendation"
+  "uncertainty": "string",
+  "capa_immediate": "string",
+  "capa_investigation": "string",
+  "capa_corrective": "string",
+  "capa_preventive": "string",
+  "capa_verification": "string",
+  "capa_effectiveness": "string",
+  "capa_precedent": "string — real recall or MAUDE ID from Available Evidence, or null"
 }
-"""
-
-_PASS2_USER = """\
-You have just produced the above risk assessment. Now review it against this checklist:
-
-CHECKLIST:
-1. MATRIX MATH — Does your S×P combination map correctly to the risk_level per the defined matrix?
-   Verify cell by cell. Correct if wrong.
-
-2. CITATION COVERAGE — If risk_level is ALARP or UNACCEPTABLE, does evidence_basis contain at
-   least one specific FDA record ID? If not, either add citations from the provided evidence or
-   downgrade risk_level to ACCEPTABLE.
-
-3. CAPA PROPORTIONALITY —
-   • UNACCEPTABLE: capa_immediate must specify a concrete action within hours.
-   • ALARP: capa_immediate must be present and specific.
-   • ACCEPTABLE: capa_investigation should still be present.
-   Fix any mismatch.
-
-4. PRECEDENT LINKAGE — Does capa_precedent cite a real ID from the evidence provided
-   (matching_recalls or matching_events)? If you used a fabricated ID, correct it to a real one
-   from the input, or set it to null.
-
-5. UNCERTAINTY — Does the uncertainty field capture what would change this assessment
-   (e.g. if root cause confirmed, if patient outcome unknown, if trending upward)?
-
-Return ONLY a revised JSON object with the same schema as your draft.
-If a field needs no change, carry it forward unchanged.
-Do not add commentary outside the JSON.
 """
 
 
@@ -245,10 +214,10 @@ Do not add commentary outside the JSON.
 
 def risk_analysis_agent(state: dict) -> dict:
     """
-    Full ISO 14971 risk assessment — two-pass with episodic memory.
+    Tool-first ISO 14971 risk assessment with episodic memory.
 
     Reads from state (set by upstream agents):
-        failure_mode, severity_indicator, modality, manufacturer, device_model,
+        complaint_text, failure_mode, modality, manufacturer, device_model,
         software_version, component, qms_complaint_category, is_safety_related
           ← written by extraction_agent
 
@@ -273,28 +242,52 @@ def risk_analysis_agent(state: dict) -> dict:
     W = 64
 
     print(f"\n{'─' * W}")
-    print("  RISK ANALYSIS AGENT  [LIVE — claude-sonnet-4-6]")
+    print("  RISK ANALYSIS AGENT  [tools: deterministic | narrative: claude-sonnet-4-6]")
     print(f"{'─' * W}")
 
-    # ── 1. Episodic memory: load past similar reports ─────────────────────
     failure_mode = state.get("failure_mode") or ""
     modality = state.get("modality") or ""
-    past_reports = load_past_reports(failure_mode, modality)
+    matching_events = state.get("matching_events") or []
+    matching_recalls = state.get("matching_recalls") or []
+    similar_event_ids = state.get("similar_event_ids") or []
 
     print(f"  ← reading from state (upstream agents):")
     print(f"      {'failure_mode':<28} = {failure_mode}")
     print(f"      {'modality':<28} = {modality}")
-    print(f"      {'manufacturer':<28} = {state.get('manufacturer')}")
-    print(f"      {'device_model':<28} = {state.get('device_model')}")
-    print(f"      {'software_version':<28} = {state.get('software_version')}")
-    print(f"      {'severity_indicator':<28} = {state.get('severity_indicator')}  (from extraction)")
-    print(f"      {'qms_complaint_category':<28} = {state.get('qms_complaint_category')}")
-    print(f"      {'matching_events':<28} = {len(state.get('matching_events') or [])} events")
-    print(f"      {'matching_recalls':<28} = {len(state.get('matching_recalls') or [])} recall(s)")
-    print(f"      {'cluster_label':<28} = {state.get('cluster_label')}")
-    print(f"      {'trend_flag':<28} = {state.get('trend_flag')} "
-          f"(growth {state.get('growth_rate_30d')})")
-    print(f"      {'past_signal_reports (SQLite)':<28} = {len(past_reports)} matching record(s)")
+    print(f"      {'matching_events':<28} = {len(matching_events)} events")
+    print(f"      {'matching_recalls':<28} = {len(matching_recalls)} recall(s)")
+    print(f"      {'cluster_size':<28} = {state.get('cluster_size')}")
+    print(f"      {'trend_flag':<28} = {state.get('trend_flag')} (growth {state.get('growth_rate_30d')})")
+
+    # ── TOOL 1: severity ────────────────────────────────────────────────────
+    severity = score_severity(state["complaint_text"])
+    print(f"\n  [TOOL] score_severity()")
+    print(f"      severity_level   = {severity['severity_level']}"
+          f"{'  (default — no keyword match)' if severity['default_applied'] else ''}")
+    print(f"      matched_phrases  = {severity['matched_phrases']}")
+
+    # ── TOOL 2: probability ─────────────────────────────────────────────────
+    probability = compute_probability(
+        event_count=len(matching_events),
+        recall_count=len(matching_recalls),
+        growth_rate_30d=state.get("growth_rate_30d"),
+        cluster_size=state.get("cluster_size"),
+    )
+    print(f"  [TOOL] compute_probability()")
+    print(f"      probability_level = {probability['probability_level']}")
+    print(f"      basis              = {probability['basis']}")
+
+    # ── TOOL 3: risk matrix lookup (pure dict, no LLM) ──────────────────────
+    risk_level = apply_risk_matrix(severity["severity_level"], probability["probability_level"])
+    print(f"  [TOOL] apply_risk_matrix({severity['severity_level']}, {probability['probability_level']}) = {risk_level}")
+
+    # ── TOOL 4: episodic memory ──────────────────────────────────────────────
+    past_reports = load_past_reports(failure_mode, modality)
+    print(f"  [TOOL] load_past_reports() = {len(past_reports)} matching record(s)")
+
+    # ── TOOL 5: CAPA requirements ─────────────────────────────────────────────
+    capa_reqs = lookup_capa_requirements(risk_level)
+    print(f"  [TOOL] lookup_capa_requirements({risk_level}) = {capa_reqs}")
 
     if past_reports:
         past_context = "\n## Past Similar Signal Reports (from episodic memory)\n"
@@ -302,13 +295,12 @@ def risk_analysis_agent(state: dict) -> dict:
             past_context += (
                 f"- {r['document_id']} ({r['generated_at'][:10]}): "
                 f"{r['failure_mode']} / {r['modality']} → {r['risk_level']} "
-                f"[{r['severity_level']}×{r['probability_level']}] "
-                f"CAPA precedent: {r.get('capa_precedent', 'N/A')}\n"
+                f"[{r['severity_level']}×{r['probability_level']}]\n"
             )
     else:
         past_context = "\n## Past Similar Signal Reports\nNone found in episodic memory.\n"
 
-    # ── 2. Build context block from state fields ───────────────────────────
+    # ── Build context for the narrative-only LLM call ──────────────────────
     context = f"""
 ## Complaint
 {state['complaint_text']}
@@ -319,148 +311,101 @@ def risk_analysis_agent(state: dict) -> dict:
 - Software Version:    {state.get('software_version')}
 - Component:           {state.get('component')}
 - Failure Mode:        {state.get('failure_mode')}
-- Severity Indicator:  {state.get('severity_indicator')} (initial estimate from extraction)
 - QMS Category:        {state.get('qms_complaint_category')}
-- Safety Related:      {state.get('is_safety_related')}
 
-## FDA Evidence
-{state.get('regulatory_context', 'No regulatory context available.')}
+## FIXED VALUES (already determined by deterministic tools — do not change these)
+- severity_level:    {severity['severity_level']}  (matched: {severity['matched_phrases']})
+- probability_level: {probability['probability_level']}  (basis: {probability['basis']})
+- risk_level:        {risk_level}
 
+## REQUIRED CAPA PARAMETERS (your CAPA narrative must be consistent with these)
+{json.dumps(capa_reqs, indent=2)}
+
+## Available Evidence (ONLY cite IDs that appear here)
 Matching Adverse Events:
-{json.dumps(state.get('matching_events', []), indent=2)}
+{json.dumps(matching_events, indent=2)}
 
 Matching Recalls:
-{json.dumps(state.get('matching_recalls', []), indent=2)}
+{json.dumps(matching_recalls, indent=2)}
+
+Similarity cluster member IDs (also citable): {similar_event_ids}
 
 ## Trend Data
-- Cluster:       {state.get('cluster_label')} (size: {state.get('cluster_size', 'unknown')})
-- Trend:         {state.get('trend_flag')} (30-day growth rate: {state.get('growth_rate_30d')})
-- Similar IDs:   {state.get('similar_event_ids', [])}
+- Cluster:  {state.get('cluster_label')} (size: {state.get('cluster_size', 'unknown')})
+- Trend:    {state.get('trend_flag')} (30-day growth rate: {state.get('growth_rate_30d')})
 {past_context}"""
 
-    # ── 3. Pass 1 — generate initial assessment ───────────────────────────
-    # Anthropic: system is a top-level param; messages list is user/assistant only.
-    # Prefill with "{" forces the model to open a JSON object immediately.
-    print(f"\n  [Pass 1] calling claude-sonnet-4-6 → initial ISO 14971 assessment ...")
-    p1_user_content = f"Perform ISO 14971 risk assessment:\n{context}"
-    p1_turn = [
-        {"role": "user",      "content": p1_user_content},
-        {"role": "assistant", "content": "{"},          # JSON prefill
-    ]
-    p1_response = client.messages.create(
+    # ── LLM call — narrative only ────────────────────────────────────────────
+    print(f"\n  [LLM] calling claude-sonnet-4-6 → narrative for fixed risk_level={risk_level} ...")
+    user_content = f"Write the risk assessment narrative for:\n{context}"
+    turn = [{"role": "user", "content": user_content}]
+    response = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=4096,
-        system=_PASS1_SYSTEM,
-        messages=p1_turn,
+        system=_NARRATIVE_SYSTEM,
+        messages=turn,
         temperature=0.2,
     )
-    p1_raw = "{" + p1_response.content[0].text         # re-attach prefill
-    p1_result = json.loads(p1_raw)
+    raw = response.content[0].text
+    narrative = _parse_json_response(raw)
+    print(f"  [LLM] done. proposed {len(narrative.get('evidence_basis', []))} citation(s)")
 
-    print(f"  [Pass 1] done.")
-    print(f"      risk_level       = {p1_result.get('risk_level')}")
-    print(f"      severity         = {p1_result.get('severity_level')} — {p1_result.get('severity_rationale', '')[:60]}")
-    print(f"      probability      = {p1_result.get('probability_level')} — {p1_result.get('probability_rationale', '')[:60]}")
-    print(f"      evidence_basis   = {len(p1_result.get('evidence_basis', []))} citation(s)")
-    for ev in p1_result.get("evidence_basis", []):
-        print(f"          [{ev.get('source')}] {ev.get('id')} — {ev.get('relevance', '')[:50]}")
-
-    # ── 4. Pass 2 — self-critique and revision (always runs) ─────────────
-    print(f"\n  [Pass 2] self-critique checklist (matrix math, citations, CAPA, precedent) ...")
-    p2_turn = [
-        {"role": "user",      "content": p1_user_content},
-        {"role": "assistant", "content": p1_raw},
-        {"role": "user",      "content": _PASS2_USER},
-        {"role": "assistant", "content": "{"},          # JSON prefill
-    ]
-    p2_response = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=4096,
-        system=_PASS1_SYSTEM,
-        messages=p2_turn,
-        temperature=0.1,
+    # ── TOOL 6: validate citations — strip anything hallucinated ────────────
+    cited_ids = [e.get("id") for e in narrative.get("evidence_basis", []) if e.get("id")]
+    validated = validate_evidence_citations(
+        cited_ids=cited_ids,
+        matching_events=matching_events,
+        matching_recalls=matching_recalls,
+        similar_event_ids=similar_event_ids,
     )
-    p2_raw = "{" + p2_response.content[0].text
-    result = json.loads(p2_raw)
+    evidence_basis = [
+        e for e in narrative.get("evidence_basis", [])
+        if e.get("id") in validated["valid_ids"]
+    ]
+    print(f"  [TOOL] validate_evidence_citations() = {validated['valid_count']} valid"
+          f"{', ' + str(len(validated['invalid_ids'])) + ' stripped (hallucinated)' if validated['invalid_ids'] else ''}")
 
-    changed = result.get("risk_level") != p1_result.get("risk_level") or \
-              len(result.get("evidence_basis", [])) != len(p1_result.get("evidence_basis", []))
-    print(f"  [Pass 2] done. {'(changes made)' if changed else '(no changes from Pass 1)'}")
-    print(f"      risk_level       = {result.get('risk_level')}")
-    print(f"      evidence_basis   = {len(result.get('evidence_basis', []))} citation(s)")
-    for ev in result.get("evidence_basis", []):
-        print(f"          [{ev.get('source')}] {ev.get('id')} — {ev.get('relevance', '')[:50]}")
-
-    # ── 5. Hard guardrail — enforced in Python after both passes ─────────
-    risk = result.get("risk_level", "ACCEPTABLE")
-    evidence = result.get("evidence_basis", [])
-
-    if risk in ("ALARP", "UNACCEPTABLE") and len(evidence) == 0:
-        print(f"\n  [Guardrail] ✗ {risk} with 0 citations — force-downgrading to ACCEPTABLE")
-        logger.warning(
-            "[risk_analysis_agent] Guardrail: %s with 0 citations after Pass 2. "
-            "Force-downgrading to ACCEPTABLE.",
-            risk,
-        )
-        result["risk_level"] = "ACCEPTABLE"
-        result["uncertainty"] = (
-            f"[DOWNGRADED from {risk}] Model assigned elevated risk but provided no "
-            "FDA citations after two passes. Assessment requires human review with "
-            "direct evidence lookup. " + (result.get("uncertainty") or "")
-        )
-        risk = "ACCEPTABLE"
-        evidence = []
-
-    # ── 6. Escalation flags — deterministic, never by LLM ────────────────
-    escalation_required = risk in ("ALARP", "UNACCEPTABLE")
-    prrc_notification   = risk == "UNACCEPTABLE"
-    # fsca_required needs confirmed root cause + active distribution — human decision only
-    fsca_required       = False
-
-    gate3_passed = not (risk == "UNACCEPTABLE" and len(evidence) == 0)
+    # ── TOOL 7: escalation flags — finalized now that evidence_count is known ─
+    flags = compute_escalation_flags(risk_level, evidence_count=len(evidence_basis))
+    print(f"  [TOOL] compute_escalation_flags({risk_level}, evidence_count={len(evidence_basis)}) = {flags}")
 
     all_messages = (state.get("messages") or []) + [
-        {"role": "user",      "content": p1_user_content},
-        {"role": "assistant", "content": p1_raw},
-        {"role": "user",      "content": _PASS2_USER},
-        {"role": "assistant", "content": p2_raw},
+        {"role": "user", "content": user_content},
+        {"role": "assistant", "content": raw},
     ]
 
     print(f"\n  → writing to state:")
-    print(f"      {'risk_level':<28} = {risk}")
-    print(f"      {'severity_level':<28} = {result.get('severity_level')}")
-    print(f"      {'probability_level':<28} = {result.get('probability_level')}")
-    print(f"      {'hazardous_situation':<28} = {(result.get('hazardous_situation') or '')[:60]}")
-    print(f"      {'harm':<28} = {(result.get('harm') or '')[:60]}")
-    print(f"      {'evidence_basis':<28} = {len(evidence)} citation(s)")
-    print(f"      {'escalation_required':<28} = {escalation_required}")
-    print(f"      {'prrc_notification_required':<28} = {prrc_notification}")
-    print(f"      {'fsca_required':<28} = {fsca_required}")
-    print(f"      {'gate3_passed':<28} = {gate3_passed}")
-    print(f"      {'capa_immediate':<28} = {(result.get('capa_immediate') or '')[:60]}")
-    print(f"      {'capa_precedent':<28} = {result.get('capa_precedent')}")
-    print(f"      {'uncertainty':<28} = {(result.get('uncertainty') or '')[:60]}")
+    print(f"      {'severity_level':<28} = {severity['severity_level']}  (TOOL)")
+    print(f"      {'probability_level':<28} = {probability['probability_level']}  (TOOL)")
+    print(f"      {'risk_level':<28} = {risk_level}  (TOOL)")
+    print(f"      {'hazardous_situation':<28} = {(narrative.get('hazardous_situation') or '')[:60]}")
+    print(f"      {'harm':<28} = {(narrative.get('harm') or '')[:60]}")
+    print(f"      {'evidence_basis':<28} = {len(evidence_basis)} citation(s)")
+    print(f"      {'escalation_required':<28} = {flags['escalation_required']}  (TOOL)")
+    print(f"      {'prrc_notification_required':<28} = {flags['prrc_notification_required']}  (TOOL)")
+    print(f"      {'gate3_passed':<28} = {flags['gate3_passed']}  (TOOL)")
+    print(f"      {'capa_immediate':<28} = {(narrative.get('capa_immediate') or '')[:60]}")
 
     return {
-        "hazardous_situation":        result.get("hazardous_situation"),
-        "harm":                       result.get("harm"),
-        "severity_level":             result.get("severity_level"),
-        "severity_rationale":         result.get("severity_rationale"),
-        "probability_level":          result.get("probability_level"),
-        "probability_rationale":      result.get("probability_rationale"),
-        "risk_level":                 risk,
-        "evidence_basis":             evidence,
-        "uncertainty":                result.get("uncertainty"),
-        "capa_immediate":             result.get("capa_immediate"),
-        "capa_investigation":         result.get("capa_investigation"),
-        "capa_corrective":            result.get("capa_corrective"),
-        "capa_preventive":            result.get("capa_preventive"),
-        "capa_verification":          result.get("capa_verification"),
-        "capa_effectiveness":         result.get("capa_effectiveness"),
-        "capa_precedent":             result.get("capa_precedent"),
-        "escalation_required":        escalation_required,
-        "prrc_notification_required": prrc_notification,
-        "fsca_required":              fsca_required,
-        "gate3_passed":               gate3_passed,
+        "severity_level":             severity["severity_level"],
+        "probability_level":          probability["probability_level"],
+        "risk_level":                 risk_level,
+        "hazardous_situation":        narrative.get("hazardous_situation"),
+        "harm":                       narrative.get("harm"),
+        "severity_rationale":         narrative.get("severity_rationale"),
+        "probability_rationale":      narrative.get("probability_rationale"),
+        "evidence_basis":             evidence_basis,
+        "uncertainty":                narrative.get("uncertainty"),
+        "capa_immediate":             narrative.get("capa_immediate"),
+        "capa_investigation":         narrative.get("capa_investigation"),
+        "capa_corrective":            narrative.get("capa_corrective"),
+        "capa_preventive":            narrative.get("capa_preventive"),
+        "capa_verification":          narrative.get("capa_verification"),
+        "capa_effectiveness":         narrative.get("capa_effectiveness"),
+        "capa_precedent":             narrative.get("capa_precedent"),
+        "escalation_required":        flags["escalation_required"],
+        "prrc_notification_required": flags["prrc_notification_required"],
+        "fsca_required":              flags["fsca_required"],
+        "gate3_passed":               flags["gate3_passed"],
         "messages":                   all_messages,
     }

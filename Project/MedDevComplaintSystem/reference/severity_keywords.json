@@ -1,0 +1,61 @@
+{
+  "_comment": "ISO 14971:2019 Annex D severity trigger phrases. Matched case-insensitively against complaint_text. score_severity() checks S5 down to S1 and returns the HIGHEST level with >=1 match. Draft v1 — needs review against real complaint language.",
+  "S5": [
+    "death",
+    "died",
+    "fatal",
+    "fatality",
+    "patient died",
+    "resulted in death",
+    "loss of life"
+  ],
+  "S4": [
+    "permanent injury",
+    "permanent damage",
+    "permanent disability",
+    "irreversible injury",
+    "irreversible damage",
+    "surgical intervention",
+    "life-threatening",
+    "life threatening",
+    "amputation",
+    "organ failure"
+  ],
+  "S3": [
+    "non-diagnostic",
+    "nondiagnostic",
+    "repeat procedure",
+    "repeat scan",
+    "repeat surgery",
+    "repeated scan",
+    "serious injury",
+    "hospitalization",
+    "hospitalisation",
+    "misdiagnosis",
+    "missed diagnosis",
+    "delayed diagnosis",
+    "major delay",
+    "incorrect diagnosis",
+    "diagnostic error"
+  ],
+  "S2": [
+    "minor injury",
+    "minor delay",
+    "reversible injury",
+    "reversible",
+    "inconvenience",
+    "discomfort",
+    "rescheduled",
+    "extended procedure time",
+    "extended scan time",
+    "delayed treatment"
+  ],
+  "S1": [
+    "no injury",
+    "no patient harm",
+    "no clinical impact",
+    "cosmetic",
+    "no impact on diagnosis",
+    "minor inconvenience"
+  ]
+}

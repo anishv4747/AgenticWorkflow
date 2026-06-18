@@ -1,0 +1,8 @@
+{
+  "_comment": "ISO 14971 5x5 Severity x Probability acceptability matrix. Source of truth for apply_risk_matrix() — keys are 'S{n}_P{m}'. This table is fixed; an LLM never decides risk_level.",
+  "S1_P1": "ACCEPTABLE", "S1_P2": "ACCEPTABLE", "S1_P3": "ACCEPTABLE", "S1_P4": "ACCEPTABLE", "S1_P5": "ALARP",
+  "S2_P1": "ACCEPTABLE", "S2_P2": "ACCEPTABLE", "S2_P3": "ACCEPTABLE", "S2_P4": "ALARP",      "S2_P5": "ALARP",
+  "S3_P1": "ACCEPTABLE", "S3_P2": "ACCEPTABLE", "S3_P3": "ALARP",      "S3_P4": "UNACCEPTABLE", "S3_P5": "UNACCEPTABLE",
+  "S4_P1": "ACCEPTABLE", "S4_P2": "ALARP",      "S4_P3": "UNACCEPTABLE", "S4_P4": "UNACCEPTABLE", "S4_P5": "UNACCEPTABLE",
+  "S5_P1": "ALARP",      "S5_P2": "UNACCEPTABLE", "S5_P3": "UNACCEPTABLE", "S5_P4": "UNACCEPTABLE", "S5_P5": "UNACCEPTABLE"
+}
