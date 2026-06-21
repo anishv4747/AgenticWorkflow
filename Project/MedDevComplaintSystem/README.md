@@ -54,7 +54,7 @@ python pipeline.py --complaint "During a CT scan on a Siemens SOMATOM, the recon
 | `extraction_agent` | MOCK | Returns hardcoded Philips MRI extraction fields |
 | `retrieval_agent` | MOCK | Returns 3 MAUDE events + 1 Class II recall (Z-2024-00423) |
 | `similarity_module` | MOCK | Returns cluster 12 (MRI_SSFP_artifact_cluster, emerging trend) |
-| `risk_analysis_agent` | **LIVE** | Calls `claude-sonnet-4-6` — ISO 14971 two-pass assessment |
+| `risk_analysis_agent` | **LIVE** | Calls `claude-sonnet-4-6` — ISO 14971 autonomous tool-calling assessment |
 | `report_agent` | MOCK | Prints a stub document with the risk level from state |
 
 **Gates:**
@@ -84,13 +84,16 @@ The terminal prints each agent's inputs and outputs as it runs:
   → writing to state:    cluster_id, trend_flag, growth_rate_30d
 
 ────────────────────────────────────────────────────────────────
-  RISK ANALYSIS AGENT  [LIVE — claude-sonnet-4-6]
+  RISK ANALYSIS AGENT  [autonomous tool-calling | claude-sonnet-4-6]
 ────────────────────────────────────────────────────────────────
-  [Pass 1] calling claude-sonnet-4-6 → initial assessment ...
-  [Pass 1] done.  risk_level = ALARP, citations = 4
-
-  [Pass 2] self-critique checklist ...
-  [Pass 2] done.  (no changes from Pass 1)
+  [LOOP] starting tool-calling loop (cap 6 iters / 30s)...
+  [TOOL] turn 1: score_severity(...) -> ok
+  [TOOL] turn 1: compute_probability(...) -> ok
+  [TOOL] turn 1: load_past_reports(...) -> ok
+  [TOOL] turn 2: apply_risk_matrix(...) -> ok
+  [TOOL] turn 3: lookup_capa_requirements(...) -> ok
+  [TOOL] turn 4: submit_risk_narrative(...) -> ok
+  [RESULT] severity_level=S3 probability_level=P3 risk_level=ALARP
 
   → writing to state:    risk_level, severity, probability, CAPA, escalation flags
 
@@ -112,11 +115,13 @@ Followed by a final summary block with all risk assessment fields.
 MedDevComplaintSystem/
 ├── pipeline.py               # LangGraph graph + mock agents — entry point
 ├── agents/
-│   └── risk_analysis.py      # Live Risk Analysis Agent (ISO 14971, two-pass LLM)
+│   ├── risk_analysis.py      # Live Risk Analysis Agent (ISO 14971, autonomous tool-calling loop)
+│   └── risk_tools.py         # Deterministic tools (severity/probability/risk_matrix/CAPA/escalation)
 ├── data/
 │   └── signal_reports.db     # SQLite episodic memory (auto-created on first run)
 ├── specs/                    # Agent design specs (agent-01 through agent-06)
 ├── PLAN.md                   # Architecture + ComplaintState TypedDict + graph wiring
+├── PLAN_v2.md                # Risk Analysis Agent v2: autonomous tool-calling design
 └── .env                      # ANTHROPIC_API_KEY (never committed)
 ```
 
